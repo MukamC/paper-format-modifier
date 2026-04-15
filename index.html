@@ -1219,14 +1219,16 @@ body { margin: 0; background: #fff; }
           }
           const { PDFDocument, PDFName, PDFHexString } = window.PDFLib;
 
-          // UTF-16BE 编码 → PDF 批注正确显示中文
+          // UTF-16BE → PDF hex string（中文批注）
+          // PDFHexString.of(s) 把 s 每个字符的 charCode 转成两位 hex，
+          // 所以必须把每个字节值作为单字符传入，不能先转成 hex 字符串再传。
           const pdfStr = (str) => {
-            const b = [0xFE, 0xFF];
+            let s = String.fromCharCode(0xFE, 0xFF); // BOM
             for (let i = 0; i < str.length; i++) {
               const c = str.charCodeAt(i);
-              b.push((c >> 8) & 0xFF, c & 0xFF);
+              s += String.fromCharCode((c >>> 8) & 0xFF, c & 0xFF);
             }
-            return PDFHexString.of(b.map(x => x.toString(16).padStart(2,'0')).join('').toUpperCase());
+            return PDFHexString.of(s);
           };
 
           const raw    = await thesisRawFile.arrayBuffer();
