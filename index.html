@@ -1,0 +1,1573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>论文格式校准工具</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    import React, { useState, useEffect, useRef, Fragment } from 'https://esm.sh/react@18.2.0';
+    import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
+    import {
+      FileText, Upload, CheckCircle2, AlertTriangle, Info,
+      FileCheck, Settings, Download, AlertCircle, BarChart3,
+      FileSearch, ChevronDown, BookOpen
+    } from 'https://esm.sh/lucide-react@0.309.0';
+    import htm from 'https://esm.sh/htm@3.1.1';
+
+    const html = htm.bind(React.createElement);
+
+    if (typeof pdfjsLib !== 'undefined') {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+
+    // ─── 常量 ──────────────────────────────────────────────────────────────
+    const RULE_LEVELS = {
+      L1: { label: '必须修改', color: 'text-red-600',   bg: 'bg-red-50',   border: 'border-red-200',   icon: AlertCircle },
+      L2: { label: '建议修改', color: 'text-amber-600', bg: 'bg-amber-50', border: 'border-amber-200', icon: AlertTriangle },
+      L3: { label: '提示关注', color: 'text-blue-600',  bg: 'bg-blue-50',  border: 'border-blue-200',  icon: Info },
+    };
+
+    const DEFAULT_RULES = [
+      { id: 'font-main',    category: '字体排版', field: '正文字体',     value: '宋体',        source: '默认基线' },
+      { id: 'font-title',   category: '字体排版', field: '章标题字体',   value: '黑体',        source: '默认基线' },
+      { id: 'size-main',    category: '字体排版', field: '正文字号',     value: '小四 (12pt)', source: '默认基线' },
+      { id: 'size-title1',  category: '字体排版', field: '一级标题字号', value: '三号 (16pt)', source: '默认基线' },
+      { id: 'line-spacing', category: '字体排版', field: '正文行距',     value: '1.5',         source: '默认基线' },
+      { id: 'margin-top',   category: '页面设置', field: '上页边距',     value: '2.5 cm',      source: '默认基线' },
+      { id: 'margin-left',  category: '页面设置', field: '左页边距',     value: '3.0 cm',      source: '默认基线' },
+      { id: 'fig-pos',      category: '图表公式', field: '图题位置',     value: '图下方居中',  source: '默认基线' },
+      { id: 'table-pos',    category: '图表公式', field: '表题位置',     value: '表上方居中',  source: '默认基线' },
+      { id: 'ref-order',    category: '参考文献', field: '排序方式',     value: '按引用顺序',  source: '默认基线' },
+      { id: 'ref-format',   category: '参考文献', field: '引用格式',     value: 'GB/T 7714',   source: '默认基线' },
+      { id: 'page-index',   category: '页眉页脚', field: '正文页码',     value: '阿拉伯数字',  source: '默认基线' },
+    ];
+
+    // ─── 字体/字号工具 ────────────────────────────────────────────────────
+    const FONT_ALIASES = {
+      '宋体':   ['SimSun', '宋体', 'STSong', 'NSimSun'],
+      '黑体':   ['SimHei', '黑体', 'STHeiti'],
+      '楷体':   ['KaiTi', '楷体', 'STKaiti', 'KaiTi_GB2312'],
+      '仿宋':   ['FangSong', '仿宋', 'FangSong_GB2312'],
+      '微软雅黑': ['Microsoft YaHei', '微软雅黑'],
+      'Times New Roman': ['Times New Roman', 'TimesNewRoman'],
+    };
+
+    const PT_MAP = {
+      '初号': 42, '小初': 36, '一号': 28, '小一': 24,
+      '二号': 22, '小二': 18, '三号': 16, '小三': 15,
+      '四号': 14, '小四': 12, '五号': 10.5, '小五': 9,
+    };
+
+    const parsePt = (str) => {
+      if (!str) return null;
+      const num = str.match(/([0-9]+\.?[0-9]*)\s*pt?/i);
+      if (num) return parseFloat(num[1]);
+      for (const [name, pt] of Object.entries(PT_MAP)) {
+        if (str.includes(name)) return pt;
+      }
+      return null;
+    };
+
+    const isSameFont = (detected, expected) => {
+      if (!detected || !expected) return true;
+      const d = detected.toLowerCase(), e = expected.toLowerCase();
+      if (d === e || d.includes(e) || e.includes(d)) return true;
+      for (const [key, aliases] of Object.entries(FONT_ALIASES)) {
+        const inD = aliases.some(a => d.includes(a.toLowerCase()));
+        const inE = aliases.some(a => e.includes(a.toLowerCase())) || e.includes(key.toLowerCase());
+        if (inD && inE) return true;
+      }
+      return false;
+    };
+
+    // ─── OOXML 静态骨架（用于生成 .docx）────────────────────────────────
+    const DOCX_CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml"  ContentType="application/xml"/>
+  <Override PartName="/word/document.xml"
+    ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`;
+
+    const DOCX_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+    Target="word/document.xml"/>
+</Relationships>`;
+
+    const DOCX_WORD_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>`;
+
+    // 将文本转义为 XML 安全字符串
+    const xmlEsc = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+
+    // 生成一个 OOXML 段落
+    const wp = ({ text = '', bold = false, size = 24, color = '000000', indent = 0, spaceAfter = 100, style = '' } = {}) => {
+      const stylePr = style ? `<w:pStyle w:val="${style}"/>` : '';
+      const indentPr = indent ? `<w:ind w:left="${indent}"/>` : '';
+      const spacePr = `<w:spacing w:after="${spaceAfter}"/>`;
+      const boldTag = bold ? '<w:b/>' : '';
+      return `<w:p><w:pPr>${stylePr}${indentPr}${spacePr}</w:pPr><w:r><w:rPr>${boldTag}<w:sz w:val="${size}"/><w:color w:val="${color}"/><w:rFonts w:eastAsia="宋体" w:ascii="Calibri"/></w:rPr><w:t xml:space="preserve">${xmlEsc(text)}</w:t></w:r></w:p>`;
+    };
+
+    // 生成带底色的段落（用于区分 L1/L2/L3）
+    const wpShaded = ({ text = '', bold = false, size = 22, fill = 'FFFFFF', color = '000000', spaceAfter = 60 } = {}) => {
+      const boldTag = bold ? '<w:b/>' : '';
+      return `<w:p><w:pPr><w:spacing w:after="${spaceAfter}"/><w:shd w:val="clear" w:fill="${fill}"/></w:pPr><w:r><w:rPr>${boldTag}<w:sz w:val="${size}"/><w:color w:val="${color}"/><w:rFonts w:eastAsia="宋体" w:ascii="Calibri"/><w:shd w:val="clear" w:fill="${fill}"/></w:rPr><w:t xml:space="preserve">${xmlEsc(text)}</w:t></w:r></w:p>`;
+    };
+
+    const LEVEL_META = {
+      L1: { label: '必须修改', fill: 'FEE2E2', color: '991B1B', accent: 'DC2626' },
+      L2: { label: '建议修改', fill: 'FEF3C7', color: '92400E', accent: 'D97706' },
+      L3: { label: '提示关注', fill: 'DBEAFE', color: '1E40AF', accent: '2563EB' },
+    };
+
+    const generateWordXml = (checkResults, fileName, rules) => {
+      const now = new Date().toLocaleDateString('zh-CN');
+      const l1 = checkResults.issues.filter(i => i.level === 'L1').length;
+      const l2 = checkResults.issues.filter(i => i.level === 'L2').length;
+      const l3 = checkResults.issues.filter(i => i.level === 'L3').length;
+      const baseName = fileName.replace(/\.[^.]+$/, '');
+
+      let body = '';
+
+      // 标题
+      body += wp({ text: '论文格式校验报告', bold: true, size: 36, spaceAfter: 80 });
+      body += wp({ text: `论文文件：${baseName}`, size: 22, color: '475569', spaceAfter: 40 });
+      body += wp({ text: `生成时间：${now}`, size: 22, color: '475569', spaceAfter: 200 });
+
+      // 摘要
+      body += wp({ text: '校验摘要', bold: true, size: 28, spaceAfter: 100 });
+      body += wp({ text: `必须修改（L1）：${l1} 条`, size: 24, color: l1 > 0 ? 'DC2626' : '000000', bold: l1 > 0, spaceAfter: 60 });
+      body += wp({ text: `建议修改（L2）：${l2} 条`, size: 24, color: l2 > 0 ? 'D97706' : '000000', bold: l2 > 0, spaceAfter: 60 });
+      body += wp({ text: `提示关注（L3）：${l3} 条`, size: 24, color: l3 > 0 ? '2563EB' : '000000', spaceAfter: 60 });
+      body += wp({ text: `中文字符数：${checkResults.wordCount.toLocaleString()}`, size: 24, spaceAfter: 200 });
+
+      if (checkResults.issues.length === 0) {
+        body += wp({ text: '✓ 未发现明显格式问题，建议仍以人工复核为准。', bold: true, size: 24, color: '16A34A', spaceAfter: 100 });
+      } else {
+        // 详细条目
+        body += wp({ text: '详细校验条目', bold: true, size: 28, spaceAfter: 120 });
+        checkResults.issues.forEach((issue, idx) => {
+          const lv = LEVEL_META[issue.level] ?? LEVEL_META.L3;
+          body += wpShaded({ text: `${idx + 1}. 【${lv.label}】${issue.title}`, bold: true, size: 24, fill: lv.fill, color: lv.accent, spaceAfter: 40 });
+          body += wpShaded({ text: `类型：${issue.type}　　位置：${issue.location}`, size: 20, fill: lv.fill, color: lv.color, spaceAfter: 40 });
+          body += wpShaded({ text: `说明：${issue.desc}`, size: 22, fill: lv.fill, color: lv.color, spaceAfter: 40 });
+          body += wpShaded({ text: `建议：${issue.suggestion}`, size: 22, fill: 'F8FAFC', color: '1E293B', spaceAfter: 40 });
+          body += wpShaded({ text: `依据：${issue.source}`, size: 20, fill: 'F8FAFC', color: '64748B', spaceAfter: 140 });
+        });
+      }
+
+      // 尾注
+      body += wp({ text: '— 本报告由论文格式校准工具 v2.0 自动生成，建议结合人工复核 —', size: 18, color: '94A3B8', spaceAfter: 60 });
+
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    ${body}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1800"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`;
+    };
+
+    // 构建 PDF 用的隐藏报告 DOM 节点
+    const buildReportElement = (checkResults, fileName, rules) => {
+      const now = new Date().toLocaleDateString('zh-CN');
+      const l1 = checkResults.issues.filter(i => i.level === 'L1').length;
+      const l2 = checkResults.issues.filter(i => i.level === 'L2').length;
+      const l3 = checkResults.issues.filter(i => i.level === 'L3').length;
+
+      const el = document.createElement('div');
+      el.style.cssText = 'font-family:SimSun,"宋体",serif;padding:28px;background:#fff;width:720px;font-size:13px;line-height:1.7;color:#1e293b';
+
+      const levelStyle = { L1: '#dc2626', L2: '#d97706', L3: '#2563eb' };
+      const levelBg    = { L1: '#fee2e2', L2: '#fef3c7', L3: '#dbeafe' };
+      const levelLabel = { L1: '必须修改', L2: '建议修改', L3: '提示关注' };
+
+      let html2 = `
+        <h1 style="font-size:22px;font-weight:bold;margin:0 0 6px;color:#1e293b">论文格式校验报告</h1>
+        <p style="color:#64748b;margin:0 0 2px;font-size:12px">论文文件：${fileName.replace(/\.[^.]+$/, '')}</p>
+        <p style="color:#64748b;margin:0 0 20px;font-size:12px">生成时间：${now}</p>
+        <hr style="border:none;border-top:2px solid #e2e8f0;margin:0 0 18px"/>
+
+        <h2 style="font-size:15px;font-weight:bold;margin:0 0 10px">校验摘要</h2>
+        <div style="display:flex;gap:12px;margin-bottom:22px">
+          <div style="flex:1;padding:10px 14px;background:#fee2e2;border-radius:8px">
+            <div style="font-size:11px;color:#7f1d1d">必须修改 (L1)</div>
+            <div style="font-size:24px;font-weight:bold;color:#dc2626">${l1}</div>
+          </div>
+          <div style="flex:1;padding:10px 14px;background:#fef3c7;border-radius:8px">
+            <div style="font-size:11px;color:#78350f">建议修改 (L2)</div>
+            <div style="font-size:24px;font-weight:bold;color:#d97706">${l2}</div>
+          </div>
+          <div style="flex:1;padding:10px 14px;background:#dbeafe;border-radius:8px">
+            <div style="font-size:11px;color:#1e3a8a">提示关注 (L3)</div>
+            <div style="font-size:24px;font-weight:bold;color:#2563eb">${l3}</div>
+          </div>
+          <div style="flex:1;padding:10px 14px;background:#f1f5f9;border-radius:8px">
+            <div style="font-size:11px;color:#475569">中文字符数</div>
+            <div style="font-size:24px;font-weight:bold;color:#334155">${checkResults.wordCount.toLocaleString()}</div>
+          </div>
+        </div>
+      `;
+
+      if (checkResults.issues.length === 0) {
+        html2 += `<p style="color:#16a34a;font-weight:bold">✓ 未发现明显格式问题，建议仍以人工复核为准。</p>`;
+      } else {
+        html2 += `<h2 style="font-size:15px;font-weight:bold;margin:0 0 12px">详细校验条目（共 ${checkResults.issues.length} 条）</h2>`;
+        checkResults.issues.forEach((issue, idx) => {
+          const c = levelStyle[issue.level] ?? '#2563eb';
+          const bg = levelBg[issue.level]  ?? '#dbeafe';
+          const lb = levelLabel[issue.level] ?? '提示';
+          html2 += `
+            <div style="border:1px solid ${c}33;border-radius:8px;overflow:hidden;margin-bottom:14px">
+              <div style="background:${bg};padding:8px 14px;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-weight:bold;color:${c};font-size:13px">【${lb}】${issue.title}</span>
+                <span style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em">${issue.type}</span>
+              </div>
+              <div style="padding:10px 14px;background:#fff">
+                <p style="margin:0 0 4px;font-size:11px;color:#64748b">位置：${issue.location}</p>
+                <p style="margin:0 0 8px;font-size:12px;color:#334155">${issue.desc}</p>
+                <div style="background:#f8fafc;border-radius:6px;padding:8px 12px;border:1px solid #e2e8f0">
+                  <div style="font-size:10px;font-weight:bold;color:#94a3b8;margin-bottom:3px">修改建议</div>
+                  <p style="margin:0;font-size:12px;color:#1e293b;font-weight:500">${issue.suggestion}</p>
+                </div>
+                <p style="margin:6px 0 0;font-size:10px;color:#94a3b8">依据：${issue.source}</p>
+              </div>
+            </div>`;
+        });
+      }
+
+      html2 += `<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 10px"/>
+        <p style="text-align:center;font-size:10px;color:#94a3b8">本报告由论文格式校准工具 v2.0 自动生成，建议结合人工复核</p>`;
+
+      el.innerHTML = html2;
+      return el;
+    };
+
+    // ─── 规范文件解析 ─────────────────────────────────────────────────────
+    const extractTextFromPDF = async (file) => {
+      if (typeof pdfjsLib === 'undefined') throw new Error('PDF 解析库未加载，请检查网络连接');
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+      let text = '';
+      for (let i = 1; i <= Math.min(pdf.numPages, 20); i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        text += content.items.map(it => it.str).join('') + '\n';
+      }
+      return text;
+    };
+
+    const extractTextFromDocx = async (file) => {
+      if (typeof mammoth === 'undefined') throw new Error('Word 解析库未加载');
+      const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+      return result.value;
+    };
+
+    const extractTextFromDoc = async (file) => {
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+
+      // 策略 1：先尝试 mammoth（对部分兼容性较好的 .doc 有效）
+      if (typeof mammoth !== 'undefined') {
+        try {
+          const result = await mammoth.extractRawText({ arrayBuffer: arrayBuffer.slice(0) });
+          if (result.value && result.value.replace(/\s/g, '').length > 80) return result.value;
+        } catch { /* 继续下一策略 */ }
+      }
+
+      // 策略 2：检测 RTF 格式（部分 .doc 实为 RTF）
+      const header6 = String.fromCharCode(...bytes.slice(0, 6));
+      if (header6.startsWith('{\\rtf')) {
+        const raw = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        // 多轮剥离 RTF 控制序列
+        let rtfText = raw
+          .replace(/\\u-?\d+\??/g, (m) => { // Unicode 转义
+            const n = parseInt(m.slice(2));
+            return n > 0 ? String.fromCharCode(n) : '';
+          })
+          .replace(/\{[^{}]{0,800}\}/g, ' ')   // 移除小型分组
+          .replace(/\\[a-zA-Z]+\-?\d*[ ]?/g, '') // 移除控制字
+          .replace(/[{}\\]/g, ' ')
+          .replace(/[ \t]{2,}/g, ' ')
+          .trim();
+        // 保留含汉字或有意义拉丁词的段落
+        rtfText = rtfText.split('\n')
+          .filter(s => /[\u4e00-\u9fff]/.test(s) || /[a-zA-Z]{4,}/.test(s))
+          .join('\n');
+        if (rtfText.length > 80) return rtfText;
+      }
+
+      // 策略 3：OLE2 二进制扫描（兜底）
+      const magic = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+      if (!magic.every((b, i) => bytes[i] === b))
+        throw new Error('无法识别文件格式，建议在 Word 中另存为 .docx 后重新上传');
+      const chunks = [];
+      let buf = '';
+      for (let i = 0; i < bytes.length - 1; i++) {
+        const lo = bytes[i], hi = bytes[i + 1];
+        const cp16 = lo | (hi << 8);
+        if ((cp16 >= 0x4E00 && cp16 <= 0x9FFF) || (cp16 >= 0x3000 && cp16 <= 0x303F) ||
+            (cp16 >= 0xFF00 && cp16 <= 0xFFEF) || (cp16 >= 0x2018 && cp16 <= 0x201F)) {
+          buf += String.fromCharCode(cp16); i++; continue;
+        }
+        if (lo >= 0x20 && lo <= 0x7E) { buf += String.fromCharCode(lo); }
+        else { const t = buf.trim(); if (t.length >= 4) chunks.push(t); buf = ''; }
+      }
+      if (buf.trim().length >= 4) chunks.push(buf.trim());
+      const text = chunks.filter(s => /[\u4e00-\u9fff]/.test(s) || /[a-zA-Z]{3,}/.test(s)).join('\n');
+      if (text.length < 30)
+        throw new Error('.doc 内容提取不足，建议在 Word 中另存为 .docx 以获得更准确的校验结果');
+      return text;
+    };
+
+    const parseSpecFile = async (file) => {
+      const n = file.name.toLowerCase();
+      if (n.endsWith('.pdf'))  return { text: await extractTextFromPDF(file) };
+      if (n.endsWith('.docx')) return { text: await extractTextFromDocx(file) };
+      if (n.endsWith('.doc'))  return { text: await extractTextFromDoc(file) };
+      if (n.endsWith('.txt') || n.endsWith('.md')) return { text: await file.text() };
+      if (file.type.startsWith('image/')) return { text: null, isImage: true };
+      throw new Error('暂不支持该格式，请上传 PDF、Word (.doc/.docx)、TXT 或图片');
+    };
+
+    // ─── DOCX 章节结构提取 ────────────────────────────────────────────────
+    const extractChaptersFromDocx = (documentXml) => {
+      if (!documentXml) return [];
+      try {
+        const WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const doc = new DOMParser().parseFromString(documentXml, 'application/xml');
+        const gw  = (el, name) => el?.getAttributeNS(WNS, name) ?? el?.getAttribute('w:' + name) ?? '';
+        const paras = doc.getElementsByTagNameNS(WNS, 'p');
+        const chapters = [];
+        let cjkAcc = 0;
+        for (const p of paras) {
+          const pPr = p.getElementsByTagNameNS(WNS, 'pPr')[0];
+          const pSt = pPr?.getElementsByTagNameNS(WNS, 'pStyle')[0];
+          const sid = gw(pSt, 'val');
+          const isH1 = /^(Heading1|heading1|标题1|标题\s*1|h1)$/i.test(sid);
+          const ts = p.getElementsByTagNameNS(WNS, 't');
+          let txt = '';
+          for (const t of ts) txt += t.textContent;
+          if (isH1 && txt.trim()) {
+            chapters.push({ title: txt.trim(), approxPage: Math.max(1, Math.ceil(cjkAcc / 900)) });
+          }
+          cjkAcc += (txt.match(/[\u4e00-\u9fff]/g) ?? []).length;
+        }
+        return chapters;
+      } catch { return []; }
+    };
+
+    // ─── 论文文件解析（含 DOCX XML）────────────────────────────────────────
+    const extractDocxXml = async (file) => {
+      if (typeof JSZip === 'undefined') return null;
+      try {
+        const zip = await JSZip.loadAsync(await file.arrayBuffer());
+        const documentXml = (await zip.file('word/document.xml')?.async('text')) ?? '';
+        const stylesXml   = (await zip.file('word/styles.xml')?.async('text'))   ?? '';
+        const chapters    = extractChaptersFromDocx(documentXml);
+        return { documentXml, stylesXml, chapters };
+      } catch { return null; }
+    };
+
+    const parseThesisFile = async (file) => {
+      const n = file.name.toLowerCase();
+      if (n.endsWith('.pdf'))  return { text: await extractTextFromPDF(file),   xmlData: null };
+      if (n.endsWith('.docx')) {
+        const text    = await extractTextFromDocx(file);
+        const xmlData = await extractDocxXml(file);
+        return { text, xmlData };
+      }
+      if (n.endsWith('.doc'))  return { text: await extractTextFromDoc(file),   xmlData: null };
+      if (n.endsWith('.txt') || n.endsWith('.md')) return { text: await file.text(), xmlData: null };
+      throw new Error('论文格式暂不支持，请上传 PDF 或 Word (.doc/.docx)');
+    };
+
+    // ─── 规则提取 ─────────────────────────────────────────────────────────
+    const extractRulesFromText = (rawText) => {
+      // ── 预处理：去除 OCR 噪声、统一标点 ───────────────────────────────
+      let text = rawText;
+      // 多轮去除 CJK 字符之间的空格（覆盖"正 文"、"宋 体"等 OCR 错误）
+      for (let i = 0; i < 5; i++) {
+        text = text.replace(/([\u4e00-\u9fff\uff00-\uffef])\s+([\u4e00-\u9fff\uff00-\uffef])/g, '$1$2');
+      }
+      // 全角→半角标点统一（OCR 混用）
+      text = text.replace(/：/g, ':').replace(/；/g, ';').replace(/（/g, '(').replace(/）/g, ')');
+      // 将表格分隔符（连续空格/Tab）规范化，方便后续匹配
+      text = text.replace(/[ \t]{2,}/g, ' ');
+
+      const rules = DEFAULT_RULES.map(r => ({ ...r }));
+      const mark = (id, value) => {
+        const i = rules.findIndex(r => r.id === id);
+        if (i >= 0 && value) rules[i] = { ...rules[i], value: value.trim(), source: '规范文件' };
+      };
+      const FONTS = '(宋体|楷体|黑体|仿宋|微软雅黑|Times\\s*New\\s*Roman|Arial|Calibri)';
+      const SIZES = '(小[一二三四五六初]号?|[一二三四五六初]号|[0-9]+\\.?[0-9]*\\s*[pP][tT]|[0-9]+\\s*磅)';
+
+      // ① 正文字体（多种表达方式）
+      const fm = text.match(new RegExp(`正文[^，。;\\n]{0,25}?${FONTS}`, 'i'))
+              || text.match(new RegExp(`${FONTS}[^，。;\\n]{0,25}?正文`, 'i'))
+              || text.match(new RegExp(`全文[^，。;\\n]{0,20}?${FONTS}`, 'i'))
+              || text.match(new RegExp(`${FONTS}[^，。;\\n]{0,15}?全文`, 'i'))
+              || text.match(new RegExp(`中文字[体]?[^，。;\\n]{0,20}?${FONTS}`, 'i'))
+              || text.match(new RegExp(`汉字[^，。;\\n]{0,15}?${FONTS}`, 'i'))
+              || text.match(new RegExp(`${FONTS}[^，。;\\n]{0,12}?中文`, 'i'))
+              || text.match(new RegExp(`采用${FONTS}`, 'i'))
+              || text.match(new RegExp(`使用${FONTS}[^，。;\\n]{0,15}?字体`, 'i'));
+      if (fm) mark('font-main', fm[1] || fm[2]);
+
+      // ② 章/节标题字体（多种表达方式）
+      const tfm = text.match(new RegExp(`[章节]?标题[^，。;\\n]{0,25}?${FONTS}`, 'i'))
+               || text.match(new RegExp(`${FONTS}[^，。;\\n]{0,25}?[章节]?标题`, 'i'))
+               || text.match(new RegExp(`["""]?章["""]?[^，。;\\n]{0,20}?${FONTS}`, 'i'))
+               || text.match(new RegExp(`一级标题[^，。;\\n]{0,20}?${FONTS}`, 'i'))
+               || text.match(new RegExp(`大标题[^，。;\\n]{0,15}?${FONTS}`, 'i'));
+      if (tfm) mark('font-title', tfm[1] || tfm[2]);
+
+      // ③ 正文字号（多种表达方式，含纯数字 pt/磅）
+      const sm = text.match(new RegExp(`正文[^，。;\\n]{0,30}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`${SIZES}[^，。;\\n]{0,30}?正文`, 'i'))
+              || text.match(new RegExp(`全文[^，。;\\n]{0,20}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`中文[字体]?[^，。;\\n]{0,20}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`字[体号][^，。;\\n]{0,10}?${SIZES}[^，。;\\n]{0,10}?正文`, 'i'));
+      if (sm) mark('size-main', (sm[1] || '').replace(/磅$/, 'pt'));
+
+      // ④ 一级标题字号（兼容"章标题"/"大标题"/"第X章"等写法）
+      const t1 = text.match(new RegExp(`一级标题[^，。;\\n]{0,25}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`章标题[^，。;\\n]{0,25}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`大标题[^，。;\\n]{0,20}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`["""]?章["""]?[^，。;\\n]{0,15}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`标题1[^，。;\\n]{0,20}?${SIZES}`, 'i'))
+              || text.match(new RegExp(`${SIZES}[^，。;\\n]{0,20}?章标题`, 'i'));
+      if (t1) mark('size-title1', (t1[1] || '').replace(/磅$/, 'pt'));
+
+      // ⑤ 行距（倍数/固定磅值/多行距等多种写法）
+      const spFixed = text.match(/固定[行间]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(磅|pt|points?)/i)
+                   || text.match(/行距\s*:?\s*固定值\s*([0-9]+\.?[0-9]*)\s*(磅|pt)/i)
+                   || text.match(/固定值\s*([0-9]+\.?[0-9]*)\s*(磅|pt)/i);
+      if (spFixed) {
+        // 固定值 X 磅，估算倍数（相对 12pt 正文）
+        const ptVal = parseFloat(spFixed[1]);
+        const multi = (ptVal / 12).toFixed(1);
+        mark('line-spacing', multi);
+      } else {
+        const sp = text.match(/行[间]?距[^，。;\n]{0,25}?([0-9]+\.?[0-9]*)\s*(倍行[间]?距?|倍)/i)
+                || text.match(/([0-9]+\.?[0-9]*)\s*倍行[间]?距/i)
+                || text.match(/([0-9]+\.?[0-9]*)\s*倍[^，。;\n]{0,5}?行[间]?距/i)
+                || text.match(/([0-9]+\.?[0-9]*)\s*倍[^，。;\n]{0,10}?间距/i)
+                || text.match(/行距\s*:?\s*([0-9]+\.?[0-9]*)\s*倍/i)
+                || text.match(/行距\s*[为是]\s*([0-9]+\.?[0-9]*)/i);
+        if (sp) mark('line-spacing', sp[1]);
+      }
+
+      // ⑥ 页边距（支持上下/左右同时指定、以及独立指定）
+      const topM = text.match(/上[页边]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(cm|厘米)/i)
+                || text.match(/上下[页边]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(cm|厘米)/i);
+      if (topM) mark('margin-top', topM[1] + ' cm');
+
+      const leftM = text.match(/左[页边]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(cm|厘米)/i)
+                 || text.match(/左右[页边]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(cm|厘米)/i)
+                 || text.match(/装订[侧]?[页边]?距\s*:?\s*([0-9]+\.?[0-9]*)\s*(cm|厘米)/i);
+      if (leftM) mark('margin-left', leftM[1] + ' cm');
+
+      // 尝试解析"页边距：上2.5，下2.5，左3.0，右2.5 cm"这类综合表述
+      const multiM = text.match(/上\s*([0-9]+\.?[0-9]*)[^，;：\n]{0,5}[，;]?\s*下\s*([0-9]+\.?[0-9]*)[^，;：\n]{0,5}[，;]?\s*左\s*([0-9]+\.?[0-9]*)/i);
+      if (multiM && !topM)  mark('margin-top',  multiM[1] + ' cm');
+      if (multiM && !leftM) mark('margin-left', multiM[3] + ' cm');
+
+      // ⑦ 图题位置（含"置于图下方"/"标注在图片下方"等变体）
+      if      (text.match(/图[题标注]?[^，。;\n]{0,20}?(图[的]?下|置于[^。;\n]{0,8}下|下方居中)/i)) mark('fig-pos', '图下方居中');
+      else if (text.match(/图[题标注]?[^，。;\n]{0,20}?(图[的]?上|置于[^。;\n]{0,8}上|上方居中)/i)) mark('fig-pos', '图上方居中');
+
+      // ⑧ 表题位置
+      if      (text.match(/表[题标注]?[^，。;\n]{0,20}?(表[的]?上|置于[^。;\n]{0,8}上|上方居中)/i)) mark('table-pos', '表上方居中');
+      else if (text.match(/表[题标注]?[^，。;\n]{0,20}?(表[的]?下|置于[^。;\n]{0,8}下|下方居中)/i)) mark('table-pos', '表下方居中');
+
+      // ⑨ 参考文献排序
+      if      (text.match(/参考文献[^。\n]{0,60}?(出现顺序|引用顺序|顺序编号|按序)/i)) mark('ref-order', '按引用顺序');
+      else if (text.match(/参考文献[^。\n]{0,60}?(作者|字母)/i))                       mark('ref-order', '按作者字母序');
+
+      // ⑩ 参考文献格式（含变体写法）
+      if      (text.match(/GB\s*[\/\-]?\s*T\s*7714/i)) mark('ref-format', 'GB/T 7714');
+      else if (text.match(/\bGBT7714\b/i))              mark('ref-format', 'GB/T 7714');
+      else if (text.match(/\bAPA\b/i))                  mark('ref-format', 'APA');
+      else if (text.match(/\bMLA\b/i))                  mark('ref-format', 'MLA');
+      else if (text.match(/\bChicago\b/i))              mark('ref-format', 'Chicago');
+
+      // ⑪ 页码形式（正文页码 & 前置部分页码）
+      if      (text.match(/正文[^。\n]{0,30}?阿拉伯/i) || text.match(/页码[^。\n]{0,25}?阿拉伯/i)) mark('page-index', '阿拉伯数字');
+      else if (text.match(/正文[^。\n]{0,30}?罗马/i)   || text.match(/页码[^。\n]{0,25}?罗马/i))   mark('page-index', '罗马数字');
+
+      return rules;
+    };
+
+    // ─── DOCX 样式解析 ────────────────────────────────────────────────────
+    const parseDocxStyles = (stylesXml) => {
+      if (!stylesXml) return {};
+      const WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+      const doc = new DOMParser().parseFromString(stylesXml, 'application/xml');
+      const gw = (el, name) => el?.getAttributeNS(WNS, name) ?? el?.getAttribute('w:' + name) ?? null;
+      const result = {};
+      for (const s of doc.getElementsByTagNameNS(WNS, 'style')) {
+        const id = gw(s, 'styleId'); if (!id) continue;
+        const rPr = s.getElementsByTagNameNS(WNS, 'rPr')[0];
+        const pPr = s.getElementsByTagNameNS(WNS, 'pPr')[0];
+        const rf  = rPr?.getElementsByTagNameNS(WNS, 'rFonts')[0];
+        const sz  = rPr?.getElementsByTagNameNS(WNS, 'sz')[0];
+        const sp  = pPr?.getElementsByTagNameNS(WNS, 'spacing')[0];
+        result[id] = {
+          font: gw(rf, 'eastAsia') || gw(rf, 'ascii') || gw(rf, 'hAnsi'),
+          size: sz ? Math.round(parseInt(gw(sz, 'val') ?? '0') / 2) : null,
+          lineSpacing: sp ? gw(sp, 'line') : null,
+          lineRule:    sp ? gw(sp, 'lineRule') : null,
+        };
+      }
+      const defRPr = doc.getElementsByTagNameNS(WNS, 'rPrDefault')[0]
+                       ?.getElementsByTagNameNS(WNS, 'rPr')[0];
+      if (defRPr) {
+        const rf = defRPr.getElementsByTagNameNS(WNS, 'rFonts')[0];
+        const sz = defRPr.getElementsByTagNameNS(WNS, 'sz')[0];
+        result['__default__'] = {
+          font: gw(rf, 'eastAsia') || gw(rf, 'ascii'),
+          size: sz ? Math.round(parseInt(gw(sz, 'val') ?? '0') / 2) : null,
+        };
+      }
+      return result;
+    };
+
+    const getStyleProp = (styles, prop, ...ids) => {
+      for (const id of ids) {
+        const v = styles[id]?.[prop];
+        if (v !== null && v !== undefined) return v;
+      }
+      return null;
+    };
+
+    // ─── 定位工具 ─────────────────────────────────────────────────────────
+    // 根据字符位置估算页码（约 900 CJK 字/页，标准论文排版）
+    const estimatePage = (text, charPos) => {
+      const cjk = (text.slice(0, charPos).match(/[\u4e00-\u9fff]/g) ?? []).length;
+      return Math.max(1, Math.ceil(cjk / 900));
+    };
+
+    // 取指定位置前后的可读文字片段
+    const textExcerpt = (text, pos, radius = 22) => {
+      const s = Math.max(0, pos - radius);
+      const e = Math.min(text.length, pos + radius + 3);
+      return (s > 0 ? '…' : '') + text.slice(s, e).replace(/[\r\n]+/g, ' ') + (e < text.length ? '…' : '');
+    };
+
+    // ─── 校验引擎 ─────────────────────────────────────────────────────────
+    const runChecks = (text, xmlData, rules) => {
+      const issues = [];
+      let uid = 1;
+      const push = (level, location, type, title, desc, suggestion, source) =>
+        issues.push({ id: uid++, level, location, type, title, desc, suggestion, source });
+      const rv = (id) => rules.find(r => r.id === id)?.value ?? '';
+      const rsrc = (id) => rules.find(r => r.id === id)?.source ?? '规范要求';
+
+      // ── 章节感知定位 ────────────────────────────────────────────────────
+      const chapters = xmlData?.chapters ?? [];
+      const chapLoc = (pageNum) => {
+        let ch = null;
+        for (const c of chapters) { if (c.approxPage <= pageNum) ch = c; else break; }
+        return ch ? `第 ${pageNum} 页·${ch.title}` : `约第 ${pageNum} 页`;
+      };
+
+      // ── A. 字数统计 ─────────────────────────────────────────────────────
+      const cjkCount = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) ?? []).length;
+
+      // ── B. 参考文献双向引用 ──────────────────────────────────────────────
+      const inlineCits = new Set();
+      let m;
+      const citPat = /\[(\d+(?:\s*[,，\-–]\s*\d+)*)\]/g;
+      while ((m = citPat.exec(text)) !== null) {
+        for (const seg of m[1].split(/[,，]/)) {
+          const parts = seg.trim().split(/[-–]/);
+          if (parts.length === 2) {
+            const [a, b] = [parseInt(parts[0]), parseInt(parts[1])];
+            if (!isNaN(a) && !isNaN(b)) for (let i = a; i <= b; i++) inlineCits.add(i);
+          } else { const n = parseInt(parts[0]); if (!isNaN(n)) inlineCits.add(n); }
+        }
+      }
+      const refEntries = new Set();
+      const refPat = /^\s*\[(\d+)\]\s*.{5}/gm;
+      while ((m = refPat.exec(text)) !== null) refEntries.add(parseInt(m[1]));
+
+      if (inlineCits.size > 0 || refEntries.size > 0) {
+        const ghost = [...inlineCits].filter(n => !refEntries.has(n)).sort((a,b) => a-b);
+        if (ghost.length > 0) {
+          // 尝试定位第一个幽灵引用的页码
+          const firstGhostStr = `[${ghost[0]}]`;
+          const firstGhostPos = text.indexOf(firstGhostStr);
+          const ghostPage = firstGhostPos >= 0 ? chapLoc(estimatePage(text, firstGhostPos)) : '文末参考文献列表';
+          push('L1', ghostPage, '引用完整性',
+            `幽灵引用（${ghost.length} 条）`,
+            `正文引用了 [${ghost.join(', ')}]，但参考文献列表中未找到对应条目`,
+            `请在文末参考文献列表中补充条目：[${ghost.join('], [')}]`,
+            '系统双向校验引擎');
+        }
+        const orphan = [...refEntries].filter(n => !inlineCits.has(n)).sort((a,b) => a-b);
+        if (orphan.length > 0 && orphan.length <= 15)
+          push('L2', '文末参考文献列表', '引用完整性',
+            `孤立条目（${orphan.length} 条）`,
+            `参考文献列表中的 [${orphan.join(', ')}] 在正文中未检测到对应引用`,
+            `请确认是否应引用这些条目，或将其从列表中删除`,
+            '系统双向校验引擎');
+      }
+
+      // ── C. 中英文标点混用（精准模式，逐条定位）─────────────────────────
+      const lines = text.split('\n');
+      // 预计算每行在全文中的起始字符偏移
+      const lineOffsets = [];
+      { let off = 0; for (const l of lines) { lineOffsets.push(off); off += l.length + 1; } }
+
+      const punctHits = [];
+      let punctCapped = false;
+      const PUNCT_MAP = { ',': '，', ';': '；', ':': '：', '!': '！' };
+
+      outer: for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (/^\s*\[\d+\]/.test(line)) continue;          // 参考文献条目
+        if (/\bdoi:|isbn:|issn:|vol\.|[Pp]p\.|[Ee]ds?\./i.test(line)) continue; // 文献信息行
+
+        const lp = /[\u4e00-\u9fff]([,;:!])(?=\s*[\u4e00-\u9fff])/g;
+        let pm;
+        while ((pm = lp.exec(line)) !== null) {
+          const before = line.slice(Math.max(0, pm.index - 15), pm.index);
+          if (/[a-zA-Z0-9]\s*$/.test(before)) continue;   // 英文/公式语境
+          const absPos = lineOffsets[li] + pm.index + 1;   // 标点字符位置
+          const pageNum = estimatePage(text, absPos);
+          const excerpt = textExcerpt(text, absPos, 25);
+          const wrongPunct = pm[1];
+          const rightPunct = PUNCT_MAP[wrongPunct] ?? wrongPunct;
+          punctHits.push({ pageNum, excerpt, wrongPunct, rightPunct });
+          if (punctHits.length >= 30) { punctCapped = true; break outer; }
+        }
+      }
+
+      // 前 8 条独立呈现（精确定位），超出部分汇总为一条
+      const PUNCT_SHOW = 8;
+      punctHits.slice(0, PUNCT_SHOW).forEach(hit => {
+        push('L2',
+          chapLoc(hit.pageNum),
+          '中英文混排',
+          `英文半角"${hit.wrongPunct}"用于中文语境`,
+          `原文：${hit.excerpt}`,
+          `请将此处的英文"${hit.wrongPunct}"改为中文全角"${hit.rightPunct}"`,
+          '默认基线（中文标点规范）');
+      });
+      if (punctHits.length > PUNCT_SHOW) {
+        const extra = punctHits.length - PUNCT_SHOW;
+        push('L2',
+          `另有 ${extra}${punctCapped ? '+' : ''} 处（已仅列前 ${PUNCT_SHOW} 条）`,
+          '中英文混排',
+          `更多英文标点混用（另 ${extra}${punctCapped ? '+' : ''} 处）`,
+          `全文还存在更多类似问题，建议逐章核查，或在 Word 中批量替换`,
+          '在 Word 中用"查找替换"（Ctrl/Cmd+H）将半角","批量替换为全角"，"等',
+          '默认基线（中文标点规范）');
+      }
+
+      // ── D. 参考文献格式 ──────────────────────────────────────────────────
+      const refFmt = rv('ref-format');
+      if (refFmt === 'GB/T 7714' && refEntries.size >= 3) {
+        if (!/\[\d+\].+?[\[（(][JMCDRSPNG][\]）)]/.test(text))
+          push('L2', '参考文献列表', '参考文献',
+            '未检测到 GB/T 7714 文献类型标识',
+            '规范要求使用 GB/T 7714 格式，但未发现 [J]、[M]、[C]、[D] 等文献类型标识符',
+            '请为每条参考文献补充文献类型标识，如期刊加 [J]，专著加 [M]，学位论文加 [D]',
+            rsrc('ref-format'));
+      }
+
+      // ── E. DOCX 格式参数校验 ─────────────────────────────────────────────
+      if (xmlData?.stylesXml) {
+        const styles = parseDocxStyles(xmlData.stylesXml);
+
+        // 正文字体
+        const bodyFont = getStyleProp(styles, 'font', 'Normal', 'normal', '正文', '__default__');
+        const expBF = rv('font-main');
+        if (bodyFont && expBF && !isSameFont(bodyFont, expBF))
+          push('L1', '正文样式（Normal）', '字体排版', '正文字体不符合规范',
+            `检测到正文字体为"${bodyFont}"，规范要求"${expBF}"`,
+            `请在 Word 中修改"正文"样式的中文字体为"${expBF}"`, rsrc('font-main'));
+
+        // 正文字号
+        const bodySize = getStyleProp(styles, 'size', 'Normal', 'normal', '正文', '__default__');
+        const expBSStr = rv('size-main');
+        const expBS = parsePt(expBSStr);
+        if (bodySize && expBS && Math.abs(bodySize - expBS) > 0.5)
+          push('L1', '正文样式（Normal）', '字体排版', '正文字号不符合规范',
+            `检测到正文字号为 ${bodySize}pt，规范要求 ${expBSStr}（${expBS}pt）`,
+            `请在 Word 中将"正文"样式字号修改为 ${expBSStr}`, rsrc('size-main'));
+
+        // 一级标题字体
+        const h1Font = getStyleProp(styles, 'font', 'Heading1', 'heading1', '1', 'Heading 1', '标题1', '标题 1');
+        const expH1F = rv('font-title');
+        if (h1Font && expH1F && !isSameFont(h1Font, expH1F))
+          push('L1', '一级标题样式（Heading 1）', '字体排版', '章标题字体不符合规范',
+            `检测到一级标题字体为"${h1Font}"，规范要求"${expH1F}"`,
+            `请在 Word 中修改"标题 1"样式的中文字体为"${expH1F}"`, rsrc('font-title'));
+
+        // 一级标题字号
+        const h1Size = getStyleProp(styles, 'size', 'Heading1', 'heading1', '1', 'Heading 1', '标题1', '标题 1');
+        const expH1SStr = rv('size-title1');
+        const expH1S = parsePt(expH1SStr);
+        if (h1Size && expH1S && Math.abs(h1Size - expH1S) > 0.5)
+          push('L2', '一级标题样式（Heading 1）', '字体排版', '章标题字号不符合规范',
+            `检测到一级标题字号为 ${h1Size}pt，规范要求 ${expH1SStr}（${expH1S}pt）`,
+            `请在 Word 中将"标题 1"样式字号修改为 ${expH1SStr}`, rsrc('size-title1'));
+
+        // 行距
+        const lineSpacing = getStyleProp(styles, 'lineSpacing', 'Normal', 'normal', '正文');
+        const lineRule    = getStyleProp(styles, 'lineRule',    'Normal', 'normal', '正文');
+        const expSpStr = rv('line-spacing');
+        const expSp = parseFloat(expSpStr);
+        if (lineSpacing && lineRule === 'auto' && !isNaN(expSp)) {
+          const detected = parseInt(lineSpacing) / 240;
+          if (Math.abs(detected - expSp) > 0.15)
+            push('L2', '正文样式（Normal）', '字体排版', '正文行距不符合规范',
+              `检测到正文行距约 ${detected.toFixed(2)} 倍，规范要求 ${expSpStr} 倍`,
+              `请在 Word 段落格式中将行距设为"多倍行距 ${expSp}"`, rsrc('line-spacing'));
+        }
+      } else if (text.length > 0) {
+        push('L3', '全文', '字体排版', 'PDF / .doc 格式无法自动检测排版参数',
+          '字体、字号、行距等参数只能从 Word (.docx) 文件中自动提取，当前格式不支持',
+          '建议使用 Word (.docx) 格式上传，以获得完整的格式校验能力',
+          '工程边界说明');
+      }
+
+      // ── F. 图题/表题位置提示 ──────────────────────────────────────────
+      const figCount = (text.match(/图\s*\d/g) ?? []).length;
+      if (figCount > 0) {
+        const figRule = rv('fig-pos');
+        push('L3', `文档中约 ${figCount} 处图题`, '图表公式', '图题位置需人工确认',
+          `规范要求图题${figRule}，但从纯文本无法自动验证图题相对于图片的位置关系`,
+          '请逐一确认每个图题是否位于图片正下方并居中',
+          `规范要求：${figRule}`);
+      }
+      const tableCount = (text.match(/表\s*\d/g) ?? []).length;
+      if (tableCount > 0) {
+        const tblRule = rv('table-pos');
+        push('L3', `文档中约 ${tableCount} 处表题`, '图表公式', '表题位置需人工确认',
+          `规范要求表题${tblRule}，纯文本模式无法自动验证表题与表格的相对位置`,
+          '请逐一确认每个表题是否位于表格正上方并居中',
+          `规范要求：${tblRule}`);
+      }
+
+      // ── G. 必要章节结构检测 ──────────────────────────────────────────────
+      const hasAbstractCN = /摘\s*要/.test(text);
+      const hasAbstractEN = /\bAbstract\b/i.test(text);
+      const hasKeywordsCN = /关键词/.test(text);
+      const hasKeywordsEN = /\bKeywords?\b/i.test(text);
+      const hasRef        = /参考文献/.test(text);
+
+      if (!hasAbstractCN)
+        push('L1', '摘要页（文档前部）', '论文结构', '未检测到中文摘要',
+          '全文中未找到"摘要"标题或内容，中文摘要为学术论文必需章节',
+          '请在正文前添加中文摘要（约200~300字），并标明关键词',
+          '通用学术规范');
+      if (!hasAbstractEN)
+        push('L2', '摘要页（中文摘要后）', '论文结构', '未检测到英文摘要（Abstract）',
+          '全文中未找到英文关键词"Abstract"，多数高校要求提供英文摘要',
+          '请在中文摘要后添加英文 Abstract，内容与中文摘要对应',
+          '通用学术规范');
+      if (!hasKeywordsCN && !hasKeywordsEN)
+        push('L2', '摘要页', '论文结构', '未检测到关键词',
+          '全文中未找到"关键词"或"Keywords"，关键词是摘要页的必需组成部分',
+          '请在摘要末尾标注 3~6 个关键词，格式：关键词：词1；词2；词3',
+          '通用学术规范');
+      if (!hasRef)
+        push('L1', '文档末尾', '论文结构', '未检测到参考文献章节',
+          '全文中未找到"参考文献"标题，参考文献列表是学术论文的必要组成部分',
+          '请在正文末尾添加参考文献列表，按规范格式（如 GB/T 7714）排列',
+          '通用学术规范');
+
+      // ── H. 章节标题编号格式检测 ──────────────────────────────────────────
+      if (chapters.length > 0) {
+        const h1Titles = chapters.map(c => c.title);
+        const chineseSN = h1Titles.filter(t => /^第[一二三四五六七八九十百千\d]+[章节篇]/.test(t)).length;
+        const numericSN = h1Titles.filter(t => /^\d+[\.\s]/.test(t)).length;
+        const englishSN = h1Titles.filter(t => /^Chapter\s+\d+/i.test(t)).length;
+        const total = h1Titles.length;
+
+        // 混用检测
+        const detected = [chineseSN > 0 ? '中文序号（第X章）' : null, numericSN > 0 ? '数字序号（1.）' : null, englishSN > 0 ? '英文序号（Chapter X）' : null].filter(Boolean);
+        if (detected.length > 1)
+          push('L2', `一级标题（共 ${total} 章）`, '论文结构', '一级标题编号格式不统一',
+            `检测到标题编号混用多种格式：${detected.join('、')}`,
+            '请统一使用同一种章节编号格式（建议采用"第X章"或"数字+点"格式之一贯穿全文）',
+            '通用学术规范');
+        else if (total >= 3) {
+          // 检查章节是否有标题编号（无编号风险）
+          const noSN = h1Titles.filter(t => !/^(第|Chapter|\d)/.test(t.trim())).length;
+          if (noSN > total / 2)
+            push('L3', `一级标题（共 ${total} 章）`, '论文结构', '一级标题可能缺少编号',
+              `${noSN} 个一级标题未检测到标准章节编号（如"第X章"或"1."），请确认是否符合规范要求`,
+              '若规范要求章节编号，请为每个一级标题添加统一的编号格式',
+              '通用学术规范');
+        }
+      }
+
+      // ── I. DOCX 正文段落首行缩进检测 ────────────────────────────────────
+      if (xmlData?.documentXml) {
+        try {
+          const WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+          const docDom = new DOMParser().parseFromString(xmlData.documentXml, 'application/xml');
+          const gw = (el, name) => el?.getAttributeNS(WNS, name) ?? el?.getAttribute('w:' + name) ?? null;
+          const paras = docDom.getElementsByTagNameNS(WNS, 'p');
+          let normalCount = 0, noIndentCount = 0;
+
+          for (const p of paras) {
+            const pPr = p.getElementsByTagNameNS(WNS, 'pPr')[0];
+            const pSt = pPr?.getElementsByTagNameNS(WNS, 'pStyle')[0];
+            const sid = (gw(pSt, 'val') ?? '').toLowerCase();
+            // 只检查正文段落样式
+            if (!/(normal|正文|body text|bodytext)$/.test(sid) && sid !== '') continue;
+            // 收集段落文字
+            const ts = p.getElementsByTagNameNS(WNS, 't');
+            let txt = '';
+            for (const t of ts) txt += t.textContent;
+            if (txt.replace(/\s/g, '').length < 15) continue; // 跳过短段落
+            if (/^(摘要|Abstract|关键词|Keywords|参考文献|目录|附录)/.test(txt.trim())) continue; // 跳过特殊段落
+            normalCount++;
+            const ind = pPr?.getElementsByTagNameNS(WNS, 'ind')[0];
+            const firstLine = parseInt(gw(ind, 'firstLine') ?? '0');
+            if (firstLine < 380) noIndentCount++; // 380 twips ≈ 1.9 字符（阈值取 2 字符的 80%）
+          }
+
+          if (normalCount >= 5 && noIndentCount / normalCount > 0.25) {
+            push('L2', `正文段落（约 ${noIndentCount}/${normalCount} 个未缩进）`, '字体排版', '正文段落首行缩进不足',
+              `检测到约 ${Math.round(noIndentCount / normalCount * 100)}% 的正文段落首行缩进不足（中文规范要求 2 字符 ≈ 480 twips，检测阈值 380 twips）`,
+              '在 Word 中选中全部正文内容→段落格式→缩进→首行缩进→2字符（或约0.74cm），并通过"正文"样式统一设置',
+              '默认基线（中文学术规范）');
+          }
+        } catch { /* 解析失败则跳过此检测 */ }
+      }
+
+      // ── J. 参考文献条目引用位置定位 ──────────────────────────────────────
+      // （为幽灵引用/孤立条目补充页码信息）
+      // 已在 B 部分生成，此处不再重复；章节信息会在 chapLoc 调用时自动注入
+
+      return { issues, wordCount: cjkCount };
+    };
+
+    // ─── 步骤指示器 ──────────────────────────────────────────────────────
+    const STEPS = ['上传规范', '确认规则', '上传论文', '校验中', '校验报告'];
+
+    const StepIndicator = ({ currentStep }) => html`
+      <div className="flex items-center justify-between mb-8 px-1">
+        ${STEPS.map((s, i) => html`
+          <${Fragment} key=${i}>
+            <div className="flex flex-col items-center">
+              <div className=${`w-9 h-9 rounded-full flex items-center justify-center border-2 transition-colors ${
+                currentStep > i   ? 'bg-indigo-600 border-indigo-600 text-white' :
+                currentStep === i ? 'border-indigo-600 text-indigo-600 bg-white' :
+                                    'border-slate-300 text-slate-400 bg-white'
+              }`}>
+                ${currentStep > i
+                  ? html`<${CheckCircle2} size=${17} />`
+                  : html`<span className="text-xs font-semibold">${i + 1}</span>`}
+              </div>
+              <span className=${`text-[11px] mt-1.5 font-medium whitespace-nowrap ${
+                currentStep === i ? 'text-indigo-600' : 'text-slate-400'
+              }`}>${s}</span>
+            </div>
+            ${i < STEPS.length - 1 && html`
+              <div className=${`flex-1 h-0.5 mx-2 mb-4 transition-colors ${
+                currentStep > i ? 'bg-indigo-600' : 'bg-slate-200'
+              }`} />
+            `}
+          <//>
+        `)}
+      </div>
+    `;
+
+    // ─── DropZone 复用组件 ────────────────────────────────────────────────
+    const DropZone = ({ accept, onFile, isParsing, parsingMsg, fileName, error, title, hint, acceptLabel, Icon }) => {
+      const inputRef = useRef(null);
+      const [isDragging, setIsDragging] = useState(false);
+      const handleDrop = (e) => {
+        e.preventDefault(); setIsDragging(false);
+        const f = e.dataTransfer.files[0]; if (f) onFile(f);
+      };
+      if (isParsing) return html`
+        <div className="border-2 border-dashed border-indigo-300 rounded-xl p-10 flex flex-col items-center bg-indigo-50 min-h-[200px] justify-center">
+          <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+          <p className="font-semibold text-indigo-700">${parsingMsg ? parsingMsg.split('\n')[0] : '正在解析…'}</p>
+          <p className="text-sm text-indigo-500 mt-1 max-w-[260px] text-center">${parsingMsg ? parsingMsg.split('\n').slice(1).join(' ') : fileName}</p>
+        </div>`;
+      return html`
+        <div>
+          <input ref=${inputRef} type="file" accept=${accept} style=${{ display: 'none' }}
+            onChange=${(e) => { const f = e.target.files[0]; if (f) onFile(f); }} />
+          <div
+            className=${`border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center transition-all cursor-pointer min-h-[200px] ${
+              isDragging ? 'border-indigo-400 bg-indigo-50 scale-[1.01]' : 'border-slate-200 bg-slate-50 hover:bg-slate-100'
+            }`}
+            onClick=${() => inputRef.current?.click()}
+            onDragOver=${(e) => { e.preventDefault(); setIsDragging(true); }}
+            onDragEnter=${(e) => { e.preventDefault(); setIsDragging(true); }}
+            onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setIsDragging(false); }}
+            onDrop=${handleDrop}
+          >
+            <div className=${`p-4 rounded-full bg-white shadow-sm mb-4 transition-transform ${isDragging ? 'scale-110' : ''}`}>
+              <${Icon} className=${isDragging ? 'text-indigo-500' : 'text-indigo-600'} size=${32} />
+            </div>
+            <h3 className="font-semibold text-slate-800">${isDragging ? '松开即可上传' : title}</h3>
+            <p className="text-sm text-slate-500 mt-1 text-center">
+              ${hint}<br/>
+              <span className="text-xs text-slate-400">${acceptLabel}</span>
+            </p>
+            ${fileName && !error && html`
+              <div className="mt-3 flex items-center gap-2 px-3 py-1.5 bg-green-50 border border-green-200 rounded-lg">
+                <${CheckCircle2} size=${14} className="text-green-600 shrink-0" />
+                <span className="text-xs text-green-700 truncate max-w-[200px]">${fileName}</span>
+                <span className="text-xs text-slate-400 ml-1">（点击重新选择）</span>
+              </div>`}
+            ${!fileName && html`
+              <button className="mt-4 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors pointer-events-none">
+                点击选择文件
+              </button>`}
+            ${error && html`
+              <div className="mt-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg w-full">
+                <p className="text-sm text-red-600">${error}</p>
+              </div>`}
+          </div>
+        </div>`;
+    };
+
+    // ─── 主应用 ──────────────────────────────────────────────────────────
+    function App() {
+      const [step, setStep]         = useState(0);
+      const [rules, setRules]       = useState(DEFAULT_RULES);
+
+      // 规范文件
+      const [specFileName, setSpecFileName]     = useState('');
+      const [specText, setSpecText]             = useState('');
+      const [specImageUrl, setSpecImageUrl]     = useState('');
+      const [specIsParsing, setSpecIsParsing]   = useState(false);
+      const [specError, setSpecError]           = useState('');
+      const [hitCount, setHitCount]             = useState(0);
+      const [showPreview, setShowPreview]       = useState(false);
+
+      // 论文文件
+      const [thesisFileName, setThesisFileName]     = useState('');
+      const [thesisText, setThesisText]             = useState('');
+      const [thesisXmlData, setThesisXmlData]       = useState(null);
+      const [thesisIsParsing, setThesisIsParsing]   = useState(false);
+      const [thesisError, setThesisError]           = useState('');
+      const [thesisRawFile, setThesisRawFile]       = useState(null);   // 保存原始 File 对象供标注使用
+      const [annotating, setAnnotating]             = useState(false);  // 标注中加载态
+
+      // 校验
+      const [checkResults, setCheckResults] = useState({ issues: [], wordCount: 0 });
+      const [progress, setProgress]         = useState(0);
+
+      const nextStep = () => setStep(s => s + 1);
+      const prevStep = () => setStep(s => s - 1);
+
+      // ── 规范文件处理 ──────────────────────────────────────────────────
+      const [specOcrStatus, setSpecOcrStatus] = useState('');
+
+      const processSpecFile = async (file) => {
+        setSpecFileName(file.name); setSpecIsParsing(true);
+        setSpecError(''); setSpecImageUrl(''); setSpecText(''); setSpecOcrStatus('');
+
+        if (file.type.startsWith('image/') || /\.(jpe?g|png|gif|bmp|webp|tiff?|heic)$/i.test(file.name)) {
+          const reader = new FileReader();
+          reader.onload = async (e) => {
+            const dataUrl = e.target.result;
+            setSpecImageUrl(dataUrl);
+
+            // OCR：尝试用 Tesseract.js 识别图片中的文字
+            if (typeof Tesseract !== 'undefined') {
+              try {
+                setSpecOcrStatus('正在 OCR 识别图片文字…\n识别中文规范文档，约需 15–40 秒，请耐心等待');
+                const { data: { text: ocrText } } = await Tesseract.recognize(
+                  dataUrl, 'chi_sim+eng',
+                  { logger: m => { if (m.status === 'recognizing text') setSpecOcrStatus(`OCR 识别中…\n进度 ${Math.round(m.progress * 100)}%`); } }
+                );
+                if (ocrText && ocrText.trim().length > 20) {
+                  setSpecText(ocrText);
+                  const extracted = extractRulesFromText(ocrText);
+                  const hits = extracted.filter(r => r.source === '规范文件').length;
+                  setHitCount(hits); setRules(extracted);
+                } else {
+                  setRules(DEFAULT_RULES); setHitCount(0);
+                }
+              } catch {
+                setRules(DEFAULT_RULES); setHitCount(0);
+              }
+            } else {
+              setRules(DEFAULT_RULES); setHitCount(0);
+            }
+            setSpecIsParsing(false); nextStep();
+          };
+          reader.readAsDataURL(file); return;
+        }
+
+        try {
+          const { text } = await parseSpecFile(file);
+          setSpecText(text);
+          const extracted = extractRulesFromText(text);
+          const hits = extracted.filter(r => r.source === '规范文件').length;
+          setHitCount(hits); setRules(extracted); nextStep();
+        } catch (err) { setSpecError(err.message || '解析失败，请重试'); }
+        finally { setSpecIsParsing(false); }
+      };
+
+      // ── 论文文件处理 ──────────────────────────────────────────────────
+      const processThesisFile = async (file) => {
+        setThesisFileName(file.name); setThesisIsParsing(true);
+        setThesisRawFile(file);   // 保留原始 File 供后端标注使用
+        setThesisError(''); setThesisText(''); setThesisXmlData(null);
+        try {
+          const { text, xmlData } = await parseThesisFile(file);
+          setThesisText(text); setThesisXmlData(xmlData);
+        } catch (err) { setThesisError(err.message || '论文解析失败，请重试'); }
+        finally { setThesisIsParsing(false); }
+      };
+
+      // ── 开始校验 ─────────────────────────────────────────────────────
+      const startCheck = () => {
+        const results = runChecks(thesisText, thesisXmlData, rules);
+        setCheckResults(results);
+        nextStep(); // → step 3 进度动画
+      };
+
+      // ── 进度动画 ─────────────────────────────────────────────────────
+      useEffect(() => {
+        if (step !== 3) return;
+        setProgress(0);
+        const iv = setInterval(() => {
+          setProgress(p => {
+            if (p >= 100) { clearInterval(iv); setTimeout(nextStep, 500); return 100; }
+            return p + 2;
+          });
+        }, 40);
+        return () => clearInterval(iv);
+      }, [step]);
+
+      // ── 重置 ─────────────────────────────────────────────────────────
+      const reset = () => {
+        setStep(0); setRules(DEFAULT_RULES);
+        setSpecFileName(''); setSpecText(''); setSpecImageUrl('');
+        setSpecIsParsing(false); setSpecError(''); setHitCount(0); setShowPreview(false);
+        setThesisFileName(''); setThesisText(''); setThesisXmlData(null);
+        setThesisIsParsing(false); setThesisError('');
+        setThesisRawFile(null); setAnnotating(false);
+        setCheckResults({ issues: [], wordCount: 0 }); setProgress(0);
+      };
+
+      // ── 导出 PDF ─────────────────────────────────────────────────────
+      const exportPDF = () => {
+        const el = buildReportElement(checkResults, thesisFileName, rules);
+        const baseName = thesisFileName.replace(/\.[^.]+$/, '');
+        const reportHTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8">
+<title>校验报告_${baseName}</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #fff; }
+@media print {
+  body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  @page { margin: 10mm; size: A4; }
+}
+</style>
+</head><body>${el.outerHTML}</body></html>`;
+        const blob = new Blob([reportHTML], { type: 'text/html;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const win = window.open(url, '_blank');
+        if (win) {
+          win.addEventListener('load', () => {
+            setTimeout(() => { win.print(); setTimeout(() => URL.revokeObjectURL(url), 3000); }, 400);
+          });
+        } else {
+          alert('请允许弹出窗口后重试（浏览器可能已拦截）');
+          URL.revokeObjectURL(url);
+        }
+      };
+
+      // ── 导出带批注 Word ───────────────────────────────────────────────
+      const exportWord = async () => {
+        if (typeof JSZip === 'undefined') { alert('JSZip 未加载，请检查网络连接后刷新页面'); return; }
+        const zip = new JSZip();
+        zip.file('[Content_Types].xml', DOCX_CONTENT_TYPES);
+        zip.file('_rels/.rels', DOCX_RELS);
+        zip.file('word/_rels/document.xml.rels', DOCX_WORD_RELS);
+        zip.file('word/document.xml', generateWordXml(checkResults, thesisFileName, rules));
+        const blob = await zip.generateAsync({
+          type: 'blob',
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `校验报告_${thesisFileName.replace(/\.[^.]+$/, '')}.docx`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
+
+      // ── 下载标注版原文（调用 Python 后端）────────────────────────────────
+      const exportAnnotated = async () => {
+        if (!thesisRawFile) return;
+        setAnnotating(true);
+        try {
+          const fd = new FormData();
+          fd.append('file', thesisRawFile);
+          fd.append('errors', JSON.stringify(checkResults.issues));
+          const resp = await fetch('http://localhost:5001/annotate', { method: 'POST', body: fd });
+          if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            throw new Error(e.error || `HTTP ${resp.status}`);
+          }
+          const blob = await resp.blob();
+          const url  = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `标注版_${thesisFileName}`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (err) {
+          alert(
+            `标注失败：${err.message}\n\n` +
+            `请先在终端启动后端服务：\n` +
+            `  cd ~/Desktop/thesis-checker\n` +
+            `  pip install -r requirements.txt\n` +
+            `  python server.py`
+          );
+        } finally {
+          setAnnotating(false);
+        }
+      };
+
+      const canStartCheck = thesisFileName && !thesisIsParsing && !thesisError;
+
+      return html`
+        <div className="min-h-screen bg-slate-100 text-slate-900 font-sans p-4 md:p-8">
+          <div className="max-w-5xl mx-auto">
+
+            <header className="flex items-center justify-between mb-8">
+              <div className="flex items-center gap-3">
+                <div className="bg-indigo-600 p-2 rounded-lg text-white">
+                  <${FileCheck} size=${28} />
+                </div>
+                <div>
+                  <h1 className="text-2xl font-bold tracking-tight text-slate-800">论文格式校准工具</h1>
+                  <p className="text-slate-500 text-sm">
+                    面向学术规范的智能化审核平台
+                    <span className="ml-2 px-2 py-0.5 bg-slate-200 rounded text-[10px] font-mono">v2.0</span>
+                  </p>
+                </div>
+              </div>
+              <button className="text-slate-600 hover:text-indigo-600 transition-colors">
+                <${Settings} size=${20} />
+              </button>
+            </header>
+
+            <main className="bg-white rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-200 overflow-hidden">
+              <div className="p-8">
+                <${StepIndicator} currentStep=${step} />
+
+                <!-- ═══ Step 0：上传规范文件 ═══ -->
+                ${step === 0 && html`
+                  <div className="space-y-8">
+                    <${DropZone}
+                      accept=".pdf,.docx,.doc,.txt,.md,image/*"
+                      onFile=${processSpecFile}
+                      isParsing=${specIsParsing}
+                      parsingMsg=${specOcrStatus || '正在解析规范文件…\n' + specFileName}
+                      fileName=${specFileName}
+                      error=${specError}
+                      title="上传格式规范文件"
+                      hint="拖拽或点击上传学校/院系的论文格式要求"
+                      acceptLabel="PDF · Word (.docx/.doc) · TXT · 图片截图（支持 OCR 自动识别）"
+                      Icon=${Upload}
+                    />
+                    <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-xl flex items-start gap-3">
+                      <${Info} className="text-indigo-600 shrink-0 mt-0.5" size=${18} />
+                      <div className="text-sm text-indigo-800">
+                        <p className="font-semibold">第一步：上传格式规范</p>
+                        <p className="opacity-80 mt-0.5">上传学校或院系下发的格式说明文件，工具将自动提取字体、字号、行距、页边距、参考文献格式等规则。你将在下一步核对并确认这些规则，之后再上传论文进行校验。</p>
+                      </div>
+                    </div>
+                  </div>
+                `}
+
+                <!-- ═══ Step 1：确认规则 ═══ -->
+                ${step === 1 && html`
+                  <div className="space-y-6">
+                    <div className="flex items-center justify-between flex-wrap gap-3">
+                      <h2 className="text-lg font-bold flex items-center gap-2">
+                        <${BarChart3} className="text-indigo-600" size=${20} />
+                        规范解析结果确认
+                      </h2>
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-1 bg-green-100 text-green-700 rounded text-xs font-medium">
+                          自动识别 ${hitCount} / ${rules.length} 条
+                        </span>
+                        <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded text-xs font-medium">
+                          用户修正 ＞ 规范文件 ＞ 默认基线
+                        </span>
+                      </div>
+                    </div>
+
+                    <!-- 来源说明条 -->
+                    <div className="flex flex-wrap gap-2 items-center">
+                      ${hitCount > 0
+                        ? html`<div className="flex items-center gap-2 px-3 py-2 bg-indigo-50 border border-indigo-200 rounded-lg text-sm text-indigo-800">
+                            <${CheckCircle2} size=${15} className="text-indigo-600 shrink-0" />
+                            从 <span className="font-semibold mx-1">${specFileName}</span> 识别到
+                            <span className="font-bold mx-1">${hitCount}</span> 条规则
+                          </div>`
+                        : html`<div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+                            <${AlertTriangle} size=${15} className="text-amber-600 shrink-0" />
+                            未从规范文件中自动识别到规则，所有条目均使用通用默认值
+                          </div>`}
+                      <div className="flex items-center gap-1.5 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500">
+                        <span className="w-2 h-2 rounded-full bg-indigo-400 inline-block"></span>规范文件值
+                        <span className="w-2 h-2 rounded-full bg-slate-300 inline-block ml-2"></span>通用默认值（可直接修改）
+                        <span className="w-2 h-2 rounded-full bg-purple-400 inline-block ml-2"></span>用户修正
+                      </div>
+                    </div>
+
+                    <!-- 图片 + OCR 结果 -->
+                    ${specImageUrl && html`
+                      <div className="border border-amber-200 rounded-xl overflow-hidden">
+                        <div className="bg-amber-50 px-4 py-3 flex items-center justify-between border-b border-amber-200">
+                          <div className="flex items-center gap-2">
+                            <${AlertTriangle} size=${15} className="text-amber-600 shrink-0" />
+                            <p className="text-sm text-amber-800 font-medium">
+                              ${hitCount > 0
+                                ? `OCR 已从截图识别出 ${hitCount} 条规则（见表格蓝色行）——截图未提及的项已保留通用默认值，请按需修改`
+                                : 'OCR 未能从截图提取到规则——请对照下方截图，手动修改表格中的默认值'}
+                            </p>
+                          </div>
+                          <button
+                            onClick=${() => window.open(specImageUrl, '_blank')}
+                            className="shrink-0 ml-3 px-3 py-1 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg text-xs font-medium text-amber-800 transition-colors"
+                          >↗ 大图</button>
+                        </div>
+                        <div className="p-4 bg-white overflow-auto" style=${{ maxHeight: '480px' }}>
+                          <img src=${specImageUrl} alt="规范文件截图"
+                            className="rounded border border-slate-100 shadow-sm cursor-zoom-in"
+                            style=${{ maxWidth: '100%', display: 'block', margin: '0 auto' }}
+                            onClick=${() => window.open(specImageUrl, '_blank')}
+                            title="点击查看大图" />
+                          <p className="text-center text-xs text-slate-400 mt-2">点击图片在新标签页查看原始大图</p>
+                        </div>
+                      </div>`}
+
+                    <!-- 原文预览（可折叠） -->
+                    ${specText && html`
+                      <div className="border border-slate-200 rounded-xl overflow-hidden">
+                        <button className="w-full bg-slate-50 px-4 py-3 flex items-center justify-between text-sm font-medium text-slate-700 hover:bg-slate-100 transition-colors"
+                          onClick=${() => setShowPreview(v => !v)}>
+                          <span className="flex items-center gap-2">
+                            <${FileSearch} size=${16} className="text-slate-500" />
+                            ${specImageUrl ? 'OCR 识别文字预览' : '规范文件原文预览'}（${specText.length.toLocaleString()} 字符）
+                          </span>
+                          <${ChevronDown} size=${16} className=${`text-slate-400 transition-transform ${showPreview ? 'rotate-180' : ''}`} />
+                        </button>
+                        ${showPreview && html`
+                          <div className="p-4 max-h-52 overflow-y-auto bg-white">
+                            <pre className="text-xs text-slate-600 whitespace-pre-wrap font-mono leading-relaxed">${
+                              specText.slice(0, 3000)}${specText.length > 3000 ? '\n\n… (仅展示前 3000 字符)' : ''}</pre>
+                          </div>`}
+                      </div>`}
+
+                    <!-- 规则表格（两分组：规范文件 + 通用默认） -->
+                    <div className="border border-slate-200 rounded-xl overflow-hidden">
+                      <table className="w-full text-left text-sm">
+                        <thead className="bg-slate-50 border-b border-slate-200">
+                          <tr>
+                            <th className="px-4 py-3 font-semibold text-slate-700 w-24">维度</th>
+                            <th className="px-4 py-3 font-semibold text-slate-700">字段</th>
+                            <th className="px-4 py-3 font-semibold text-slate-700">规范值（可修改）</th>
+                            <th className="px-4 py-3 font-semibold text-slate-700 text-right w-28">来源</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <!-- 规范文件识别到的行 -->
+                          ${rules.filter(r => r.source === '规范文件' || r.source === '用户修正').map(rule => html`
+                            <tr key=${rule.id} className="border-b border-slate-100 hover:bg-indigo-50/30 transition-colors bg-indigo-50/10">
+                              <td className="px-4 py-3 text-slate-500 text-xs">${rule.category}</td>
+                              <td className="px-4 py-3 font-medium text-slate-800">${rule.field}</td>
+                              <td className="px-4 py-3">
+                                <input type="text"
+                                  className="w-full bg-white border border-indigo-200 rounded px-2 py-1 focus:ring-2 focus:ring-indigo-500 outline-none text-sm"
+                                  value=${rule.value}
+                                  onInput=${(e) => setRules(prev => prev.map(r =>
+                                    r.id === rule.id ? { ...r, value: e.target.value, source: '用户修正' } : r
+                                  ))} />
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <span className=${`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                                  rule.source === '用户修正' ? 'bg-purple-100 text-purple-700' : 'bg-indigo-100 text-indigo-700'
+                                }`}>${rule.source}</span>
+                              </td>
+                            </tr>`)}
+                          <!-- 分隔行（当两组都有内容时） -->
+                          ${hitCount > 0 && rules.some(r => r.source === '默认基线') && html`
+                            <tr><td colSpan="4" className="px-4 py-2 bg-slate-100 text-xs text-slate-500 font-medium border-y border-slate-200">
+                              以下 ${rules.filter(r => r.source === '默认基线').length} 项在规范文件中未明确提及，已套用通用学术规范默认值——请按需修改
+                            </td></tr>`}
+                          <!-- 默认值行 -->
+                          ${rules.filter(r => r.source === '默认基线').map(rule => html`
+                            <tr key=${rule.id} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                              <td className="px-4 py-3 text-slate-400 text-xs">${rule.category}</td>
+                              <td className="px-4 py-3 font-medium text-slate-500">${rule.field}</td>
+                              <td className="px-4 py-3">
+                                <input type="text"
+                                  className="w-full bg-white border border-slate-200 rounded px-2 py-1 focus:ring-2 focus:ring-indigo-500 outline-none text-sm text-slate-600"
+                                  value=${rule.value}
+                                  onInput=${(e) => setRules(prev => prev.map(r =>
+                                    r.id === rule.id ? { ...r, value: e.target.value, source: '用户修正' } : r
+                                  ))} />
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-slate-100 text-slate-400">默认基线</span>
+                              </td>
+                            </tr>`)}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="flex justify-between items-center pt-4 border-t border-slate-100">
+                      <button onClick=${prevStep} className="px-6 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors">
+                        返回重传
+                      </button>
+                      <button onClick=${nextStep} className="px-8 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all">
+                        确认规则，上传论文 →
+                      </button>
+                    </div>
+                  </div>
+                `}
+
+                <!-- ═══ Step 2：上传论文 ═══ -->
+                ${step === 2 && html`
+                  <div className="space-y-8">
+                    <div className="flex items-center gap-3 p-4 bg-green-50 border border-green-200 rounded-xl">
+                      <${CheckCircle2} size=${18} className="text-green-600 shrink-0" />
+                      <p className="text-sm text-green-800">
+                        格式规则已确认（共 ${rules.length} 条）。请上传待校验的论文文件。
+                      </p>
+                    </div>
+
+                    <${DropZone}
+                      accept=".pdf,.docx,.doc,.txt,.md"
+                      onFile=${processThesisFile}
+                      isParsing=${thesisIsParsing}
+                      fileName=${thesisFileName}
+                      error=${thesisError}
+                      title="上传待校论文"
+                      hint="拖拽或点击上传论文文件"
+                      acceptLabel="Word (.docx 可获得完整格式检测) · PDF · .doc · TXT"
+                      Icon=${BookOpen}
+                    />
+
+                    ${thesisFileName && !thesisIsParsing && !thesisError && html`
+                      <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl flex items-center gap-3">
+                        <${FileText} size=${18} className="text-slate-500 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-slate-800 truncate">${thesisFileName}</p>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            ${thesisXmlData
+                              ? '✓ DOCX 格式，支持字体 / 字号 / 行距完整检测'
+                              : '⚠ 非 DOCX 格式，仅执行文本层面校验（引用、标点等）'}
+                          </p>
+                        </div>
+                      </div>`}
+
+                    <div className="flex justify-between items-center pt-4 border-t border-slate-100">
+                      <button onClick=${prevStep} className="px-6 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors">
+                        返回修改规则
+                      </button>
+                      <button
+                        onClick=${startCheck}
+                        disabled=${!canStartCheck}
+                        className=${`px-8 py-2 rounded-lg text-sm font-medium transition-all ${
+                          canStartCheck
+                            ? 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-200'
+                            : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                        }`}
+                      >
+                        开始校验
+                      </button>
+                    </div>
+                  </div>
+                `}
+
+                <!-- ═══ Step 3：校验中 ═══ -->
+                ${step === 3 && html`
+                  <div className="py-12 flex flex-col items-center justify-center">
+                    <div className="relative w-44 h-44 mb-8">
+                      <svg className="w-full h-full transform -rotate-90" viewBox="0 0 176 176">
+                        <circle cx="88" cy="88" r="80" stroke="#e2e8f0" strokeWidth="8" fill="transparent" />
+                        <circle cx="88" cy="88" r="80" stroke="#4f46e5" strokeWidth="8" fill="transparent"
+                          strokeDasharray="502.65"
+                          strokeDashoffset=${502.65 - (502.65 * progress) / 100}
+                          strokeLinecap="round"
+                          style=${{ transition: 'stroke-dashoffset 0.2s ease' }}
+                        />
+                      </svg>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center">
+                        <span className="text-3xl font-bold text-slate-800">${progress}%</span>
+                        <span className="text-xs text-slate-500 mt-1 font-medium">全域扫描中</span>
+                      </div>
+                    </div>
+                    <div className="w-full max-w-md space-y-4">
+                      ${[
+                        { label: '正在校验标题层级与目录对应关系…',  target: 20 },
+                        { label: '正在执行参考文献双向引用比对…',    target: 50 },
+                        { label: '正在检测字体、字号、行距参数…',    target: 75 },
+                        { label: '正在完成中英文标点与格式审核…',    target: 100 },
+                      ].map((task, i) => html`
+                        <div key=${i} className=${`flex items-center gap-3 transition-opacity duration-500 ${progress >= task.target ? 'opacity-100' : 'opacity-30'}`}>
+                          ${progress >= task.target
+                            ? html`<${CheckCircle2} size=${16} className="text-green-500 shrink-0" />`
+                            : html`<div className="w-4 h-4 rounded-full border-2 border-slate-200 border-t-indigo-600 animate-spin shrink-0" />`}
+                          <span className="text-sm text-slate-700">${task.label}</span>
+                        </div>`)}
+                    </div>
+                  </div>
+                `}
+
+                <!-- ═══ Step 4：校验报告 ═══ -->
+                ${step === 4 && html`
+                  <div className="space-y-6">
+                    <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+                      <div>
+                        <h2 className="text-2xl font-bold text-slate-800">校验报告摘要</h2>
+                        <p className="text-slate-500 text-sm mt-1">论文文件：${thesisFileName}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button onClick=${exportPDF} className="flex items-center gap-2 px-4 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50 transition-colors">
+                          <${Download} size=${16} /> 导出 PDF 报告
+                        </button>
+                        <button onClick=${exportWord} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-colors">
+                          <${FileText} size=${16} /> 导出带批注 Word
+                        </button>
+                        ${thesisFileName.endsWith('.docx') && thesisRawFile && html`
+                          <button onClick=${exportAnnotated} disabled=${annotating}
+                            className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 shadow-lg shadow-emerald-200 transition-colors disabled:opacity-60 disabled:cursor-not-allowed">
+                            ${annotating
+                              ? html`<div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin shrink-0"></div><span>标注中…</span>`
+                              : html`<${FileSearch} size=${16} /><span>下载标注版原文</span>`}
+                          </button>`}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      ${[
+                        { label: '必须修改 (L1)', val: checkResults.issues.filter(i => i.level==='L1').length, color: 'text-red-600',   bg: 'bg-red-50',   border: 'border border-red-100' },
+                        { label: '建议修改 (L2)', val: checkResults.issues.filter(i => i.level==='L2').length, color: 'text-amber-600', bg: 'bg-amber-50', border: 'border border-amber-100' },
+                        { label: '提示关注 (L3)', val: checkResults.issues.filter(i => i.level==='L3').length, color: 'text-blue-600',  bg: 'bg-blue-50',  border: 'border border-blue-100' },
+                        { label: '中文字符数',    val: checkResults.wordCount.toLocaleString(),               color: 'text-slate-700', bg: 'bg-slate-50', border: 'border border-slate-200' },
+                      ].map((stat, i) => html`
+                        <div key=${i} className=${`${stat.bg} ${stat.border} p-4 rounded-xl`}>
+                          <p className="text-xs text-slate-500 font-medium">${stat.label}</p>
+                          <p className=${`text-2xl font-bold mt-1 ${stat.color}`}>${stat.val}</p>
+                        </div>`)}
+                    </div>
+
+                    ${checkResults.issues.length === 0
+                      ? html`
+                        <div className="text-center py-16 border border-slate-100 rounded-2xl bg-slate-50">
+                          <${CheckCircle2} size=${52} className="text-green-500 mx-auto mb-4" />
+                          <h3 className="text-xl font-bold text-slate-800">未发现明显格式问题</h3>
+                          <p className="text-slate-500 mt-2 text-sm max-w-sm mx-auto">论文格式符合已确认的规范要求。建议仍以人工复核为准，特别是页边距和图片分辨率等参数。</p>
+                        </div>`
+                      : html`
+                        <div className="space-y-4">
+                          <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                            <${AlertCircle} size=${18} className="text-indigo-600" />
+                            详细校验条目（共 ${checkResults.issues.length} 条）
+                          </h3>
+                          ${checkResults.issues.map(issue => {
+                            const lv = RULE_LEVELS[issue.level];
+                            const LvIcon = lv.icon;
+                            return html`
+                              <div key=${issue.id} className=${`border ${lv.border} rounded-xl overflow-hidden`}>
+                                <div className=${`${lv.bg} px-4 py-3 flex items-center justify-between border-b ${lv.border}`}>
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <${LvIcon} size=${16} className=${lv.color + ' shrink-0'} />
+                                    <span className=${`text-sm font-bold ${lv.color} shrink-0`}>${lv.label}</span>
+                                    <span className="text-slate-300 mx-1 shrink-0">|</span>
+                                    <span className="text-xs font-semibold text-slate-700 truncate">${issue.location}</span>
+                                  </div>
+                                  <span className="text-[10px] uppercase tracking-wider font-bold text-slate-400 shrink-0 ml-2">${issue.type}</span>
+                                </div>
+                                <div className="p-4 bg-white">
+                                  <h4 className="font-bold text-slate-800">${issue.title}</h4>
+                                  <p className="text-sm text-slate-600 mt-1">${issue.desc}</p>
+                                  <div className="mt-3 flex flex-col md:flex-row gap-3 items-start md:items-center">
+                                    <div className="flex-1 bg-slate-50 p-3 rounded-lg border border-slate-100">
+                                      <span className="text-[10px] font-bold text-slate-400 block mb-1">修改建议</span>
+                                      <p className="text-sm text-slate-700 font-medium">${issue.suggestion}</p>
+                                    </div>
+                                    <div className="px-3 py-1.5 bg-slate-100 rounded text-[10px] font-mono text-slate-500 shrink-0">
+                                      依据：${issue.source}
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>`;
+                          })}
+                        </div>`}
+
+                    <div className="mt-8 p-6 border-2 border-indigo-100 rounded-2xl bg-indigo-50/30 flex flex-col md:flex-row items-center gap-6">
+                      <div className="flex-1">
+                        <h3 className="text-base font-bold text-indigo-900">工程边界说明</h3>
+                        <p className="text-sm text-indigo-800/70 mt-2 leading-relaxed">
+                          字体、字号、行距检测仅在上传 <strong>.docx</strong> 时生效；PDF 与 .doc 仅执行文本层校验（引用、标点等）。
+                          页边距、图片分辨率、公式内部逻辑暂不在自动检测范围内，建议人工复核。
+                        </p>
+                      </div>
+                      <button onClick=${reset}
+                        className="px-6 py-3 bg-white border border-indigo-200 text-indigo-600 rounded-xl font-bold hover:bg-indigo-50 transition-colors shadow-sm whitespace-nowrap">
+                        开始新任务
+                      </button>
+                    </div>
+                  </div>
+                `}
+
+              </div>
+            </main>
+
+            <footer className="mt-12 text-center text-slate-400 text-sm pb-8">
+              <p>© 2026 论文格式校准工具 · v2.0</p>
+              <div className="flex items-center justify-center gap-4 mt-2">
+                <a href="#" className="hover:text-indigo-600 transition-colors underline underline-offset-4">使用指南</a>
+                <a href="#" className="hover:text-indigo-600 transition-colors underline underline-offset-4">隐私政策</a>
+                <a href="#" className="hover:text-indigo-600 transition-colors underline underline-offset-4">反馈建议</a>
+              </div>
+            </footer>
+
+          </div>
+        </div>
+      `;
+    }
+
+    createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>
