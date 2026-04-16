@@ -4,7 +4,7 @@
 
 面向学术规范的智能化审核平台，帮助学生在提交前自查论文格式问题。
 
-![版本](https://img.shields.io/badge/version-v1.1-indigo)
+![版本](https://img.shields.io/badge/version-v1.3-indigo)
 ![无需构建](https://img.shields.io/badge/无需构建-纯HTML-green)
 ![在线使用](https://img.shields.io/badge/在线使用-Vercel-black)
 
@@ -14,13 +14,24 @@
 
 ## 界面预览
 
-**上传界面 — Step 1 上传规范文件**
+**Step 1 — 上传格式规范文件**
 
-![上传界面](docs/screenshot-step1.jpg)
+![上传界面](docs/screenshot-step1.png)
 
-**校验报告 — 详细问题条目（含幽灵引用、中英文标点混用定位）**
+**Step 5 — 校验报告（含三级问题分类、幽灵引用定位、一键导出）**
 
-![校验报告](docs/screenshot-report.jpg)
+![校验报告](docs/screenshot-report.png)
+
+---
+
+## 更新日志
+
+| 版本 | 更新内容 |
+|------|---------|
+| **v1.3** | 修复 PDF 批注中文乱码；步骤条支持点击回退（数据保留） |
+| v1.2 | 支持导出带批注 PDF；PDF 批注定位至具体页面 |
+| v1.1 | 导出带批注 Word；参考文献双向校验优化 |
+| v1.0 | 初始版本发布 |
 
 ---
 
